@@ -52,6 +52,22 @@ CREATE TABLE IF NOT EXISTS chunk_topics (
     PRIMARY KEY (chunk_id, topic_id)
 );
 
+CREATE TABLE IF NOT EXISTS eval_questions (
+    id               TEXT PRIMARY KEY,
+    class_id         TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    question         TEXT NOT NULL,
+    doc_id           TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    pages            TEXT NOT NULL,
+    reference_answer TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS eval_topic_labels (
+    doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    name   TEXT NOT NULL,
+    PRIMARY KEY (doc_id, name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_class ON chat_messages(class_id, id);
 CREATE INDEX IF NOT EXISTS idx_documents_class ON documents(class_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_topics_topic ON chunk_topics(topic_id);
@@ -266,3 +282,71 @@ def get_topic_pages(topic_id: str) -> list[dict]:
             (topic_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_document_topics(doc_id: str) -> list[str]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT t.name FROM topics t
+            JOIN chunk_topics ct ON ct.topic_id = t.id
+            WHERE ct.doc_id = ?
+            ORDER BY t.name COLLATE NOCASE
+            """,
+            (doc_id,),
+        ).fetchall()
+    return [r["name"] for r in rows]
+
+
+# Evaluation labels
+
+def add_eval_question(
+    class_id: str, question: str, doc_id: str, pages: list[int], reference_answer: str = ""
+) -> str:
+    question_id = new_id()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO eval_questions (id, class_id, question, doc_id, pages, reference_answer)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (question_id, class_id, question.strip(), doc_id, json.dumps(sorted(set(pages))), reference_answer.strip()),
+        )
+    return question_id
+
+
+def list_eval_questions(class_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT q.*, d.filename AS document FROM eval_questions q
+            JOIN documents d ON d.id = q.doc_id
+            WHERE q.class_id = ?
+            ORDER BY q.created_at, q.rowid
+            """,
+            (class_id,),
+        ).fetchall()
+    return [{**dict(r), "pages": json.loads(r["pages"])} for r in rows]
+
+
+def delete_eval_question(question_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM eval_questions WHERE id = ?", (question_id,))
+
+
+def set_topic_labels(doc_id: str, names: list[str]) -> None:
+    cleaned = {" ".join(n.split()) for n in names}
+    cleaned.discard("")
+    with _connect() as conn:
+        conn.execute("DELETE FROM eval_topic_labels WHERE doc_id = ?", (doc_id,))
+        conn.executemany(
+            "INSERT INTO eval_topic_labels (doc_id, name) VALUES (?, ?)", [(doc_id, n) for n in sorted(cleaned)]
+        )
+
+
+def get_topic_labels(doc_id: str) -> list[str]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM eval_topic_labels WHERE doc_id = ? ORDER BY name COLLATE NOCASE", (doc_id,)
+        ).fetchall()
+    return [r["name"] for r in rows]

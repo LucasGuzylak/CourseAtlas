@@ -37,7 +37,7 @@ class ExtractedTopic:
     pages: list[int] = field(default_factory=list)
 
 
-def _make_llm() -> ChatOllama:
+def make_json_llm() -> ChatOllama:
     kwargs = {}
     if config.OLLAMA_MODEL.startswith("qwen3"):
         kwargs["reasoning"] = False
@@ -151,7 +151,7 @@ def extract_topics(pages: list[PageContent], llm: ChatOllama | None = None) -> l
     if not batches:
         return []
 
-    llm = llm or _make_llm()
+    llm = llm or make_json_llm()
     found: list[ExtractedTopic] = []
     for batch in batches:
         response = llm.invoke(

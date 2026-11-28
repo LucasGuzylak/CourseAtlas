@@ -4,7 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from courseatlas import db, parsing, pipeline, topics
+from courseatlas import db, evaluation, parsing, pipeline, topics
 from courseatlas.schemas import Citation
 
 UPLOAD_DIR = db.DB_PATH.parent / "uploads"
@@ -99,6 +99,27 @@ def toggle_weak(topic_id: str) -> None:
     db.set_weak(topic_id, st.session_state[f"topic_{topic_id}"])
 
 
+def save_eval_question(class_id: str, doc_id: str) -> None:
+    ss = st.session_state
+    pages_key = f"eval_pages_{doc_id}"
+    question = ss.eval_question.strip()
+    if not question or not ss[pages_key]:
+        ss.notes.append(("warning", "Write a question and pick at least one page."))
+        return
+    db.add_eval_question(class_id, question, doc_id, ss[pages_key], ss.eval_reference)
+    ss.eval_question = ""
+    ss.eval_reference = ""
+    ss[pages_key] = []
+
+
+def save_topic_labels(doc_id: str) -> None:
+    db.set_topic_labels(doc_id, st.session_state[f"labels_{doc_id}"].splitlines())
+
+
+def rounded(row: dict) -> dict:
+    return {k: round(v, 3) if isinstance(v, float) else v for k, v in row.items()}
+
+
 def ask_about_topic(topic: dict) -> None:
     st.session_state.pending_prompt = (
         f"Explain {topic['name']}. I marked it as a topic I'm struggling with, so start from the basics."
@@ -151,7 +172,7 @@ with st.sidebar:
         st.divider()
         view = st.radio(
             "View",
-            ["Chat", "Documents", "Topics", "Slide Inspector"],
+            ["Chat", "Documents", "Topics", "Slide Inspector", "Evaluation"],
             horizontal=False,
             label_visibility="collapsed",
             key="view",
@@ -265,6 +286,124 @@ elif view == "Topics":
             col_explain.button("Explain this in chat", key=f"explain_{t['id']}", on_click=ask_about_topic, args=(t,))
             if col_show.toggle("Show pages", key=f"show_topic_{t['id']}"):
                 show_pages([(r["doc_id"], r["page"], f"{r['document']}, p. {r['page']}") for r in topic_pages])
+
+
+# Evaluation view
+
+elif view == "Evaluation":
+    if not documents:
+        st.info("Upload documents first, then label questions against them here.")
+        st.stop()
+
+    doc_map = {d["id"]: d for d in documents}
+    doc_name = lambda did: doc_map[did]["filename"]
+    questions = db.list_eval_questions(class_id)
+    tab_questions, tab_labels, tab_results = st.tabs(["Questions", "Topic labels", "Results"])
+
+    with tab_questions:
+        st.caption(f"{len(questions)} labeled questions. Aim for 30 to 50 spread across your documents.")
+        col_form, col_preview = st.columns(2, gap="large")
+        with col_form:
+            eval_doc = st.selectbox("Document", list(doc_map), format_func=doc_name, key="eval_doc")
+            num_pages = max(int(doc_map[eval_doc]["num_pages"] or 1), 1)
+            eval_pages = st.multiselect(
+                "Page(s) that answer the question", list(range(1, num_pages + 1)), key=f"eval_pages_{eval_doc}"
+            )
+            st.text_area("Question", key="eval_question", placeholder="How does a carry look-ahead adder avoid ripple delay?")
+            st.text_area(
+                "Reference answer (optional)",
+                key="eval_reference",
+                help="Used to grade answer accuracy. Leave it empty to only score retrieval and citations.",
+            )
+            st.button("Save question", type="primary", on_click=save_eval_question, args=(class_id, eval_doc))
+        with col_preview:
+            if eval_pages:
+                show_page(eval_doc, eval_pages[0], f"{doc_name(eval_doc)}, p. {eval_pages[0]}")
+            else:
+                st.caption("Pick a page to preview it here.")
+
+        if questions:
+            st.divider()
+        for q in questions:
+            col_q, col_del = st.columns([12, 1])
+            details = f"{q['document']}, p. {', '.join(map(str, q['pages']))}"
+            if q["reference_answer"]:
+                details += " · has reference answer"
+            col_q.markdown(f"**{q['question']}**  \n{details}")
+            col_del.button("🗑️", key=f"del_eval_{q['id']}", help="Delete", on_click=db.delete_eval_question, args=(q["id"],))
+
+    with tab_labels:
+        st.caption("List the topics you'd expect for a document. They're compared with the topics the app extracted.")
+        label_doc = st.selectbox("Document", list(doc_map), format_func=doc_name, key="label_doc")
+        saved_labels = db.get_topic_labels(label_doc)
+        extracted = db.get_document_topics(label_doc)
+        col_labels, col_extracted = st.columns(2, gap="large")
+        with col_labels:
+            st.text_area(
+                "Correct topics, one per line", value="\n".join(saved_labels), key=f"labels_{label_doc}", height=260
+            )
+            st.button("Save labels", on_click=save_topic_labels, args=(label_doc,))
+        with col_extracted:
+            st.markdown("**Extracted topics**")
+            st.markdown("\n".join(f"- {name}" for name in extracted) if extracted else "None yet.")
+        if saved_labels:
+            scores = evaluation.score_topic_list(saved_labels, extracted)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Precision", f"{scores['precision']:.0%}")
+            c2.metric("Recall", f"{scores['recall']:.0%}")
+            c3.metric("F1", f"{scores['f1']:.0%}")
+            if scores["missed"]:
+                st.caption("Missed: " + "; ".join(scores["missed"]))
+            if scores["extra"]:
+                st.caption("Extra: " + "; ".join(scores["extra"]))
+
+    with tab_results:
+        if not questions:
+            st.caption("Label some questions first.")
+        st.caption(f"Every run is also saved as JSON and CSV in {evaluation.RESULTS_DIR}.")
+
+        st.markdown("#### Retrieval")
+        compare = st.checkbox("Also run with the reranker (downloads about 1 GB the first time)")
+        if st.button("Run retrieval evaluation", disabled=not questions):
+            runs = {}
+            with st.spinner("Searching for every question..."):
+                runs["reranker off"] = evaluation.score_retrieval(class_id, questions)
+                if compare:
+                    runs["reranker on"] = evaluation.score_retrieval(class_id, questions, use_reranker=True)
+            for label, res in runs.items():
+                evaluation.save_results(f"retrieval_{label.replace(' ', '_')}", res)
+            st.session_state[f"eval_retrieval_{class_id}"] = runs
+        if runs := st.session_state.get(f"eval_retrieval_{class_id}"):
+            st.dataframe([rounded({"setup": label, **res["summary"]}) for label, res in runs.items()], hide_index=True)
+            for label, res in runs.items():
+                with st.expander(f"Per question ({label})"):
+                    st.dataframe(res["rows"], hide_index=True)
+
+        st.markdown("#### Answers")
+        st.caption("Answers every question and has the LLM judge citations, faithfulness, and accuracy. Roughly a minute per question.")
+        if st.button("Run answer evaluation", disabled=not questions):
+            bar = st.progress(0.0, text="Starting...")
+            try:
+                res = evaluation.score_answers(
+                    class_id, questions, progress=lambda done, total: bar.progress(done / total, text=f"{done}/{total} answered")
+                )
+            except RuntimeError as e:
+                st.error(str(e))
+            else:
+                evaluation.save_results("answers", res)
+                st.session_state[f"eval_answers_{class_id}"] = res
+        if res := st.session_state.get(f"eval_answers_{class_id}"):
+            st.dataframe([rounded(res["summary"])], hide_index=True)
+            with st.expander("Per question"):
+                st.dataframe([rounded(r) for r in res["rows"]], hide_index=True)
+
+        st.markdown("#### Topics")
+        topic_res = evaluation.score_topics(class_id)
+        if topic_res["rows"]:
+            st.dataframe([rounded(topic_res["summary"])], hide_index=True)
+            st.dataframe([rounded(r) for r in topic_res["rows"]], hide_index=True)
+        else:
+            st.caption("Add topic labels for at least one document to score topic extraction.")
 
 
 # Slide Inspector view (MVP 3-step pipeline visualization)
