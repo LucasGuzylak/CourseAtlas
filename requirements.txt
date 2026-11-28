@@ -1,1 +1,8 @@
 streamlit
+pymupdf
+python-pptx
+sentence-transformers
+chromadb
+langchain-text-splitters
+langchain-ollama
+langchain-core

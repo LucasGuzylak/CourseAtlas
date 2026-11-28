@@ -1,3 +1,4 @@
+import html
 import shutil
 from pathlib import Path
 
@@ -66,7 +67,12 @@ with st.sidebar:
 
     if class_id:
         st.divider()
-        view = st.radio("View", ["Chat", "Documents"], horizontal=True, label_visibility="collapsed")
+        view = st.radio(
+            "View",
+            ["Chat", "Documents", "Slide Inspector"],
+            horizontal=False,
+            label_visibility="collapsed",
+        )
 
         with st.popover("Delete class", width="stretch"):
             st.write(f"Delete **{names[class_id]}** with all its documents and chat history?")
@@ -105,7 +111,7 @@ if view == "Documents":
             path.write_bytes(f.getbuffer())
             try:
                 with st.spinner(f"Processing {f.name}..."):
-                    result = pipeline.ingest(class_id, doc_id, path)
+                    result = pipeline.ingest(class_id, doc_id, path, document_name=f.name)
                 db.add_document(class_id, doc_id, f.name, path, result.num_pages)
             except Exception as e:
                 path.unlink(missing_ok=True)
@@ -122,6 +128,122 @@ if view == "Documents":
         col_name.write(doc["filename"])
         col_pages.caption(f"{doc['num_pages']} pages" if doc["num_pages"] else "")
         col_delete.button("🗑️", key=f"del_{doc['id']}", help="Delete", on_click=remove_document, args=(class_id, doc))
+
+
+# Slide Inspector view (MVP 3-step pipeline visualization)
+
+elif view == "Slide Inspector":
+    st.caption("Slide image → Extracted text → Chunk card")
+    if not documents:
+        st.info("Upload a PDF or PPTX under **Documents** to inspect how slides are parsed and chunked.")
+        st.stop()
+
+    doc_map = {d["id"]: d for d in documents}
+    col_doc, col_page = st.columns([3, 1])
+    selected_doc_id = col_doc.selectbox(
+        "Document",
+        options=list(doc_map),
+        format_func=lambda did: doc_map[did]["filename"],
+    )
+    selected_doc = doc_map[selected_doc_id]
+    max_pages = max(int(selected_doc["num_pages"] or 1), 1)
+    selected_page = int(
+        col_page.number_input(
+            "Slide / Page",
+            min_value=1,
+            max_value=max_pages,
+            value=1,
+            step=1,
+        )
+    )
+
+    try:
+        inspection = pipeline.inspect_page(
+            class_id=class_id,
+            doc_id=selected_doc["id"],
+            file_path=selected_doc["path"],
+            page=selected_page,
+            document_name=selected_doc["filename"],
+        )
+    except Exception as e:
+        st.error(f"Could not inspect page {selected_page}: {e}")
+        st.stop()
+
+    col_img, col_text, col_chunk = st.columns([1.15, 1.0, 1.0], gap="medium")
+
+    with col_img:
+        st.markdown("#### 1. Slide image")
+        if inspection.image_bytes:
+            st.image(inspection.image_bytes, use_container_width=True)
+        else:
+            st.info(
+                "Slide image preview is rendered automatically for PDF files. "
+                "Convert PowerPoint decks to PDF for slide thumbnails."
+            )
+
+    with col_text:
+        st.markdown("#### 2. Extracted text")
+        raw_text = inspection.extracted_text or "(No extractable text on this page)"
+        escaped_text = html.escape(raw_text)
+        st.markdown(
+            f"""
+            <div style="
+                background-color: #f3f4f6;
+                color: #111827;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 14px 16px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                font-size: 0.85rem;
+                line-height: 1.5;
+                white-space: pre-wrap;
+                overflow-x: auto;
+            ">{escaped_text}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_chunk:
+        st.markdown("#### 3. Chunk card")
+        if not inspection.chunks:
+            st.caption("No chunks stored in ChromaDB for this page.")
+        else:
+            class_name = html.escape(names[class_id])
+            for chunk in inspection.chunks:
+                preview = " ".join(chunk.text.split())
+                if len(preview) > 220:
+                    preview = preview[:217].rstrip() + "..."
+                escaped_doc = html.escape(chunk.document)
+                escaped_preview = html.escape(preview)
+                escaped_cid = html.escape(chunk.chunk_id)
+                st.markdown(
+                    f"""
+                    <div style="
+                        background-color: #ffffff;
+                        color: #111827;
+                        border: 1px solid #d1d5db;
+                        border-left: 4px solid #2563eb;
+                        border-radius: 8px;
+                        padding: 14px 16px;
+                        margin-bottom: 12px;
+                        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+                    ">
+                        <div style="font-weight: 600; font-size: 0.95rem; margin-bottom: 4px;">
+                            {escaped_doc} &middot; page {chunk.page}
+                        </div>
+                        <div style="font-size: 0.85rem; color: #4b5563; margin-bottom: 10px;">
+                            Class: {class_name}
+                        </div>
+                        <div style="font-size: 0.9rem; color: #1f2937; font-style: italic; line-height: 1.45;">
+                            &ldquo;{escaped_preview}&rdquo;
+                        </div>
+                        <div style="font-size: 0.75rem; color: #6b7280; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">
+                            chunk_id: {escaped_cid}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
 
 # Chat view
