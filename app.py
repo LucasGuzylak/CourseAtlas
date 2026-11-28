@@ -4,7 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from courseatlas import db, pipeline
+from courseatlas import db, pipeline, topics
 from courseatlas.schemas import Citation
 
 UPLOAD_DIR = db.DB_PATH.parent / "uploads"
@@ -13,6 +13,8 @@ ALLOWED_TYPES = ["pdf", "pptx"]
 st.set_page_config(page_title="Course Atlas", page_icon="📚", layout="wide")
 db.init_db()
 st.session_state.setdefault("uploader_key", 0)
+st.session_state.setdefault("notes", [])
+st.session_state.setdefault("dismissed_topics", set())
 
 
 def format_citations(citations: list[Citation]) -> str:
@@ -22,7 +24,35 @@ def format_citations(citations: list[Citation]) -> str:
 def remove_document(class_id: str, doc: dict) -> None:
     pipeline.delete_document(class_id, doc["id"])
     db.delete_document(doc["id"])
+    db.delete_orphan_topics(class_id)
     Path(doc["path"]).unlink(missing_ok=True)
+
+
+def find_topics(class_id: str, doc: dict) -> None:
+    """Run topic extraction for one document and queue a note about how it went."""
+    try:
+        count = topics.extract_and_save(class_id, doc["id"], doc["path"])
+    except Exception as e:
+        st.session_state.notes.append(
+            ("warning", f"Couldn't find topics in {doc['filename']}: {e}. Is Ollama running?")
+        )
+        return
+    if count:
+        st.session_state.notes.append(("success", f"Found {count} topics in {doc['filename']}."))
+    else:
+        st.session_state.notes.append(("info", f"No topics found in {doc['filename']}."))
+
+
+def toggle_weak(topic_id: str) -> None:
+    db.set_weak(topic_id, st.session_state[f"topic_{topic_id}"])
+
+
+def ask_about_topic(topic: dict) -> None:
+    st.session_state.pending_prompt = (
+        f"Explain {topic['name']}. I marked it as a topic I'm struggling with, so start from the basics."
+    )
+    st.session_state.dismissed_topics.add(topic["id"])
+    st.session_state.view = "Chat"
 
 
 def create_class() -> None:
@@ -69,9 +99,10 @@ with st.sidebar:
         st.divider()
         view = st.radio(
             "View",
-            ["Chat", "Documents", "Slide Inspector"],
+            ["Chat", "Documents", "Topics", "Slide Inspector"],
             horizontal=False,
             label_visibility="collapsed",
+            key="view",
         )
 
         with st.popover("Delete class", width="stretch"):
@@ -85,6 +116,10 @@ if not class_id:
 
 st.header(names[class_id])
 documents = db.list_documents(class_id)
+
+for level, text in st.session_state.notes:
+    getattr(st, level)(text)
+st.session_state.notes = []
 
 
 # Documents view
@@ -104,7 +139,7 @@ if view == "Documents":
 
         for f in files:
             if f.name in existing:
-                st.warning(f"Skipped {f.name}: already uploaded.")
+                st.session_state.notes.append(("warning", f"Skipped {f.name}: already uploaded."))
                 continue
             doc_id = db.new_id()
             path = class_dir / f"{doc_id}{Path(f.name).suffix.lower()}"
@@ -115,7 +150,10 @@ if view == "Documents":
                 db.add_document(class_id, doc_id, f.name, path, result.num_pages)
             except Exception as e:
                 path.unlink(missing_ok=True)
-                st.error(f"Couldn't process {f.name}: {e}")
+                st.session_state.notes.append(("error", f"Couldn't process {f.name}: {e}"))
+                continue
+            with st.spinner(f"Finding topics in {f.name}..."):
+                find_topics(class_id, db.get_document(doc_id))
 
         st.session_state.uploader_key += 1
         st.rerun()
@@ -128,6 +166,49 @@ if view == "Documents":
         col_name.write(doc["filename"])
         col_pages.caption(f"{doc['num_pages']} pages" if doc["num_pages"] else "")
         col_delete.button("🗑️", key=f"del_{doc['id']}", help="Delete", on_click=remove_document, args=(class_id, doc))
+
+
+# Topics view
+
+elif view == "Topics":
+    missing = db.documents_without_topics(class_id)
+    if missing:
+        st.info(f"{len(missing)} document(s) have no topics yet.")
+        if st.button("Find topics"):
+            for doc in missing:
+                with st.spinner(f"Finding topics in {doc['filename']}..."):
+                    find_topics(class_id, doc)
+            st.rerun()
+
+    class_topics = db.list_topics(class_id)
+    if not class_topics:
+        st.caption("No topics yet. Topics are pulled from documents when you upload them.")
+        st.stop()
+
+    st.subheader("Which topics do you feel weak in?")
+    cols = st.columns(2)
+    for i, t in enumerate(class_topics):
+        cols[i % 2].checkbox(
+            t["name"],
+            value=t["is_weak"],
+            key=f"topic_{t['id']}",
+            on_change=toggle_weak,
+            args=(t["id"],),
+            help=f"Covered on {t['num_pages']} page(s)",
+        )
+
+    weak = db.get_weak_topics(class_id)
+    st.subheader("Pages to review")
+    if not weak:
+        st.caption("Check the topics you're struggling with and the pages that cover them will show up here.")
+    for t in weak:
+        with st.expander(t["name"], expanded=True):
+            by_doc: dict[str, list[int]] = {}
+            for row in db.get_topic_pages(t["id"]):
+                by_doc.setdefault(row["document"], []).append(row["page"])
+            for document, pages in by_doc.items():
+                st.markdown(f"**{document}**: pages {', '.join(map(str, pages))}")
+            st.button("Explain this in chat", key=f"explain_{t['id']}", on_click=ask_about_topic, args=(t,))
 
 
 # Slide Inspector view (MVP 3-step pipeline visualization)
@@ -263,7 +344,18 @@ else:
             if msg["citations"]:
                 st.caption(format_citations(msg["citations"]))
 
-    if prompt := st.chat_input(f"Ask about {names[class_id]}"):
+    weak = db.get_weak_topics(class_id)
+    offer = next((t for t in weak if t["id"] not in st.session_state.dismissed_topics), None)
+    if offer and "pending_prompt" not in st.session_state:
+        which = "the first topic" if offer["id"] == weak[0]["id"] else "another topic"
+        with st.chat_message("assistant"):
+            st.markdown(f"Would you like me to explain **{offer['name']}**, {which} you marked as confusing?")
+            col_yes, col_no, _ = st.columns([1, 1, 4])
+            col_yes.button("Yes, explain it", key="offer_yes", on_click=ask_about_topic, args=(offer,))
+            col_no.button("Not now", key="offer_no", on_click=st.session_state.dismissed_topics.add, args=(offer["id"],))
+
+    prompt = st.chat_input(f"Ask about {names[class_id]}") or st.session_state.pop("pending_prompt", None)
+    if prompt:
         with st.chat_message("user"):
             st.markdown(prompt)
         db.add_message(class_id, "user", prompt)

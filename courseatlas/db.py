@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS topics (
     class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
     name     TEXT NOT NULL,
     is_weak  INTEGER NOT NULL DEFAULT 0,
+    weak_order INTEGER,
     UNIQUE (class_id, name)
 );
 
@@ -77,6 +78,9 @@ def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        topic_cols = {r["name"] for r in conn.execute("PRAGMA table_info(topics)")}
+        if "weak_order" not in topic_cols:
+            conn.execute("ALTER TABLE topics ADD COLUMN weak_order INTEGER")
 
 
 # Classes
@@ -168,28 +172,77 @@ def clear_history(class_id: str) -> None:
 # Topics
 
 def add_topic(class_id: str, name: str) -> str:
-    name = name.strip()
+    """Return the id of the class's topic with this name (case-insensitive), creating it if needed."""
+    name = " ".join(name.split())
     with _connect() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO topics (id, class_id, name) VALUES (?, ?, ?)", (new_id(), class_id, name)
-        )
-        row = conn.execute("SELECT id FROM topics WHERE class_id = ? AND name = ?", (class_id, name)).fetchone()
-    return row["id"]
+        row = conn.execute(
+            "SELECT id FROM topics WHERE class_id = ? AND lower(name) = lower(?)", (class_id, name)
+        ).fetchone()
+        if row:
+            return row["id"]
+        topic_id = new_id()
+        conn.execute("INSERT INTO topics (id, class_id, name) VALUES (?, ?, ?)", (topic_id, class_id, name))
+    return topic_id
 
 
 def list_topics(class_id: str) -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM topics WHERE class_id = ? ORDER BY name", (class_id,)).fetchall()
+        rows = conn.execute(
+            """
+            SELECT t.*, COUNT(DISTINCT ct.doc_id || ':' || ct.page) AS num_pages
+            FROM topics t
+            LEFT JOIN chunk_topics ct ON ct.topic_id = t.id
+            WHERE t.class_id = ?
+            GROUP BY t.id
+            ORDER BY t.name COLLATE NOCASE
+            """,
+            (class_id,),
+        ).fetchall()
     return [{**dict(r), "is_weak": bool(r["is_weak"])} for r in rows]
 
 
 def set_weak(topic_id: str, weak: bool = True) -> None:
     with _connect() as conn:
-        conn.execute("UPDATE topics SET is_weak = ? WHERE id = ?", (int(weak), topic_id))
+        conn.execute(
+            """
+            UPDATE topics
+            SET is_weak = ?,
+                weak_order = CASE WHEN ? THEN (SELECT COALESCE(MAX(weak_order), 0) + 1 FROM topics) END
+            WHERE id = ?
+            """,
+            (int(weak), int(weak), topic_id),
+        )
 
 
 def get_weak_topics(class_id: str) -> list[dict]:
-    return [t for t in list_topics(class_id) if t["is_weak"]]
+    """Weak topics in the order the student marked them."""
+    weak = [t for t in list_topics(class_id) if t["is_weak"]]
+    return sorted(weak, key=lambda t: t["weak_order"] or 0)
+
+
+def delete_orphan_topics(class_id: str) -> None:
+    """Remove topics that no longer point at any page, e.g. after their document was deleted."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM topics
+            WHERE class_id = ? AND id NOT IN (SELECT DISTINCT topic_id FROM chunk_topics)
+            """,
+            (class_id,),
+        )
+
+
+def documents_without_topics(class_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM documents
+            WHERE class_id = ? AND id NOT IN (SELECT DISTINCT doc_id FROM chunk_topics)
+            ORDER BY uploaded_at, filename
+            """,
+            (class_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def link_chunk_topic(topic_id: str, chunk_id: str, doc_id: str, page: int) -> None:
