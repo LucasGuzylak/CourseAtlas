@@ -4,7 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from courseatlas import db, pipeline, topics
+from courseatlas import db, parsing, pipeline, topics
 from courseatlas.schemas import Citation
 
 UPLOAD_DIR = db.DB_PATH.parent / "uploads"
@@ -19,6 +19,58 @@ st.session_state.setdefault("dismissed_topics", set())
 
 def format_citations(citations: list[Citation]) -> str:
     return "  \n".join(f"[{i}] {c.document}, p. {c.page}" for i, c in enumerate(citations, 1))
+
+
+@st.cache_data(max_entries=300, show_spinner=False)
+def page_image(path: str, page: int, mtime: float) -> bytes | None:
+    return parsing.render_page_image(path, page, dpi=110)
+
+
+@st.cache_data(max_entries=300, show_spinner=False)
+def page_text(path: str, page: int, mtime: float) -> str:
+    return parsing.extract_single_page(path, page).text
+
+
+def show_page(doc_id: str, page: int, label: str) -> None:
+    """Render one page as an image for PDFs, or as its text for slide decks."""
+    st.caption(label)
+    doc = db.get_document(doc_id)
+    if not doc or not Path(doc["path"]).exists():
+        st.caption("This document has been removed.")
+        return
+    path = doc["path"]
+    mtime = Path(path).stat().st_mtime
+    try:
+        image = page_image(path, page, mtime)
+        if image:
+            st.image(image, width="stretch")
+            return
+        text = page_text(path, page, mtime)
+    except ValueError as e:
+        st.caption(str(e))
+        return
+    with st.container(border=True):
+        st.text(text or "(No text on this slide)")
+
+
+def show_pages(pages: list[tuple[str, int, str]], per_row: int = 3) -> None:
+    for start in range(0, len(pages), per_row):
+        cols = st.columns(per_row)
+        for col, (doc_id, page, label) in zip(cols, pages[start : start + per_row]):
+            with col:
+                show_page(doc_id, page, label)
+
+
+def cited_pages(citations: list[Citation]) -> list[tuple[str, int, str]]:
+    seen = set()
+    pages = []
+    for i, c in enumerate(citations, 1):
+        doc_id = c.chunk_id.split(":", 1)[0]
+        if (doc_id, c.page) in seen:
+            continue
+        seen.add((doc_id, c.page))
+        pages.append((doc_id, c.page, f"[{i}] {c.document}, p. {c.page}"))
+    return pages
 
 
 def remove_document(class_id: str, doc: dict) -> None:
@@ -203,12 +255,16 @@ elif view == "Topics":
         st.caption("Check the topics you're struggling with and the pages that cover them will show up here.")
     for t in weak:
         with st.expander(t["name"], expanded=True):
+            topic_pages = db.get_topic_pages(t["id"])
             by_doc: dict[str, list[int]] = {}
-            for row in db.get_topic_pages(t["id"]):
+            for row in topic_pages:
                 by_doc.setdefault(row["document"], []).append(row["page"])
             for document, pages in by_doc.items():
                 st.markdown(f"**{document}**: pages {', '.join(map(str, pages))}")
-            st.button("Explain this in chat", key=f"explain_{t['id']}", on_click=ask_about_topic, args=(t,))
+            col_explain, col_show = st.columns([1, 3])
+            col_explain.button("Explain this in chat", key=f"explain_{t['id']}", on_click=ask_about_topic, args=(t,))
+            if col_show.toggle("Show pages", key=f"show_topic_{t['id']}"):
+                show_pages([(r["doc_id"], r["page"], f"{r['document']}, p. {r['page']}") for r in topic_pages])
 
 
 # Slide Inspector view (MVP 3-step pipeline visualization)
@@ -255,7 +311,7 @@ elif view == "Slide Inspector":
     with col_img:
         st.markdown("#### 1. Slide image")
         if inspection.image_bytes:
-            st.image(inspection.image_bytes, use_container_width=True)
+            st.image(inspection.image_bytes, width="stretch")
         else:
             st.info(
                 "Slide image preview is rendered automatically for PDF files. "
@@ -338,11 +394,13 @@ else:
     if history:
         st.button("Clear chat", on_click=db.clear_history, args=(class_id,))
 
-    for msg in history:
+    for i, msg in enumerate(history):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg["citations"]:
                 st.caption(format_citations(msg["citations"]))
+                if st.toggle("Show cited pages", key=f"cited_{class_id}_{i}"):
+                    show_pages(cited_pages(msg["citations"]))
 
     weak = db.get_weak_topics(class_id)
     offer = next((t for t in weak if t["id"] not in st.session_state.dismissed_topics), None)

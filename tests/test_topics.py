@@ -70,6 +70,22 @@ class ExtractTopicsTests(unittest.TestCase):
         self.assertEqual(by_name["Paging"][:2], [1, 2])
         self.assertEqual(len(by_name["Paging"]), 2 + n_batches - 1)
 
+    def test_folds_sub_topics_into_parent(self) -> None:
+        result = topics._merge(
+            [
+                topics.ExtractedTopic("Carry Look-Ahead Adders", [4]),
+                topics.ExtractedTopic("Carry Look-Ahead: Delay", [5]),
+                topics.ExtractedTopic("Pipelining (Intro)", [6]),
+                topics.ExtractedTopic("Pipelining", [7]),
+                topics.ExtractedTopic("Caches: Write Policies", [9]),
+            ]
+        )
+        by_name = {t.name: t.pages for t in result}
+        self.assertEqual(
+            by_name,
+            {"Carry Look-Ahead Adders": [4, 5], "Pipelining": [6, 7], "Caches: Write Policies": [9]},
+        )
+
     def test_no_text_means_no_llm_call(self) -> None:
         llm = _fake_llm()
         self.assertEqual(topics.extract_topics([PageContent(page=1, text="")], llm=llm), [])

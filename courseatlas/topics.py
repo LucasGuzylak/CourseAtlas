@@ -18,10 +18,12 @@ You get numbered pages from one document. Return the specific concepts the pages
 
 Rules:
 - Use short, specific topic names a student would recognize, like "Carry Look-Ahead Adders" or "Virtual Memory Paging".
-- Skip generic or administrative items: "Introduction", "Overview", "Agenda", "Review", "Questions", "Grading", "Office Hours".
+- Skip pages that are only administrative: title slides, agendas, "Questions?", grading, office hours, homework due dates. A review page that teaches content still counts.
+- Cover every page that teaches something. Do not stop early.
+- Keep one topic per concept. Fold sub-points of a concept, like its delay, cost, or an example, into that concept's topic instead of making a new one.
+- Consecutive pages about the same concept belong to one topic.
 - Only use page numbers that appear in the input.
 - A topic can span several pages, and a page can belong to more than one topic.
-- Return between 2 and 8 topics.
 
 Respond with JSON only, in this shape:
 {"topics": [{"name": "Topic Name", "pages": [1, 2]}]}"""
@@ -113,7 +115,13 @@ def parse_topics(raw: str, valid_pages: set[int]) -> list[ExtractedTopic]:
     return topics
 
 
+def _base_name(name: str) -> str:
+    """Drop a trailing qualifier, so 'Carry Look-Ahead: Delay' becomes 'carry look-ahead'."""
+    return re.split(r"\s*(?::|\s-\s|\s–\s|\()", name, maxsplit=1)[0].strip().lower()
+
+
 def _merge(topics: list[ExtractedTopic]) -> list[ExtractedTopic]:
+    """Merge duplicates and sub-topics like "X: Delay" into the topic "X ..." they belong to."""
     merged: dict[str, ExtractedTopic] = {}
     for t in topics:
         key = t.name.lower()
@@ -121,7 +129,20 @@ def _merge(topics: list[ExtractedTopic]) -> list[ExtractedTopic]:
             merged[key].pages = sorted(set(merged[key].pages) | set(t.pages))
         else:
             merged[key] = ExtractedTopic(name=t.name, pages=list(t.pages))
-    return list(merged.values())
+
+    result = list(merged.values())
+    for sub in list(result):
+        if _base_name(sub.name) == sub.name.lower():
+            continue
+        base = _base_name(sub.name)
+        parent = next(
+            (t for t in result if t is not sub and (t.name.lower() == base or t.name.lower().startswith(base + " "))),
+            None,
+        )
+        if parent:
+            parent.pages = sorted(set(parent.pages) | set(sub.pages))
+            result.remove(sub)
+    return result
 
 
 def extract_topics(pages: list[PageContent], llm: ChatOllama | None = None) -> list[ExtractedTopic]:
